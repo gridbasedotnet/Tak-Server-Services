@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Gridbase Alert Check every 10 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=10min
+Unit=alert-check.service
+
+[Install]
+WantedBy=timers.target
