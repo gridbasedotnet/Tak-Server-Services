@@ -1,0 +1,233 @@
+#!/bin/bash
+############################################################
+# GRIDBASE ALERT-CHECK INSTALLER
+# - Installs dependencies
+# - Prompts for email + Gmail App Password
+# - Configures msmtp automatically
+# - Installs alert-check script
+# - Creates systemd service + timer
+############################################################
+
+# Colors
+GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; BLUE="\e[34m"; NC="\e[0m"
+
+echo -e "${BLUE}=== GRIDBASE ALERT-CHECK INSTALLATION ===${NC}"
+
+############################################################
+# 1. PROMPT FOR EMAIL
+############################################################
+echo -e "${YELLOW}Enter the email address where alerts should be sent:${NC}"
+read -rp "Alert Email: " ALERT_EMAIL
+
+if [[ -z "$ALERT_EMAIL" ]]; then
+    echo -e "${RED}Email cannot be empty. Exiting.${NC}"
+    exit 1
+fi
+
+############################################################
+# 2. PROMPT FOR GMAIL APP PASSWORD
+############################################################
+echo -e "${YELLOW}Enter your Gmail App Password for msmtp.${NC}"
+echo -e "${RED}IMPORTANT:${NC} This is NOT your normal Gmail password."
+echo -e "You MUST use a Gmail 'App Password'."
+echo -e "You can generate one at:"
+echo -e " https://myaccount.google.com/apppasswords"
+echo ""
+read -rsp "Gmail App Password: " GMAIL_APP_PASSWORD
+echo ""
+
+if [[ -z "$GMAIL_APP_PASSWORD" ]]; then
+    echo -e "${RED}App password cannot be empty. Exiting.${NC}"
+    exit 1
+fi
+
+############################################################
+# 3. INSTALL DEPENDENCIES
+############################################################
+echo -e "${BLUE}Installing required packages...${NC}"
+
+apt update
+apt install -y msmtp msmtp-mta mailutils ca-certificates
+
+############################################################
+# 4. CONFIGURE MSMTP
+############################################################
+echo -e "${BLUE}Configuring /etc/msmtprc ...${NC}"
+
+cat <<EOF | sudo tee /etc/msmtprc >/dev/null
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        /var/log/msmtp.log
+
+account        gridbase
+host           smtp.gmail.com
+port           587
+from           $ALERT_EMAIL
+user           $ALERT_EMAIL
+password       $GMAIL_APP_PASSWORD
+
+account default : gridbase
+EOF
+
+chmod 600 /etc/msmtprc
+touch /var/log/msmtp.log
+chmod 644 /var/log/msmtp.log
+
+echo -e "${GREEN}msmtp configured successfully.${NC}"
+
+############################################################
+# 5. INSTALL ALERT-CHECK SCRIPT
+############################################################
+echo -e "${BLUE}Installing /usr/local/bin/alert-check ...${NC}"
+
+cat <<'EOF' | sudo tee /usr/local/bin/alert-check >/dev/null
+#!/bin/bash
+
+GREEN="\e[32m"; RED="\e[31m"; YELLOW="\e[33m"; BLUE="\e[34m"; NC="\e[0m"
+
+TIMESTAMP=$(date)
+HOST=$(hostname)
+PUBLIC_IP=$(curl -s https://ifconfig.me 2>/dev/null || echo "Unavailable")
+
+EMAIL_TO="__EMAIL_PLACEHOLDER__"
+MSMTP_BIN="$(command -v msmtp || echo "")"
+
+LOGFILE="/var/log/alert-check.log"
+TMPFILE=$(mktemp)
+FAILED_FLAG=0
+
+echo "===== GRIDBASE ALERT CHECK =====" | tee "$TMPFILE"
+echo "Timestamp: $TIMESTAMP" | tee -a "$TMPFILE"
+echo "Host: $HOST" | tee -a "$TMPFILE"
+echo "Public IP: $PUBLIC_IP" | tee -a "$TMPFILE"
+echo "================================" | tee -a "$TMPFILE"
+echo | tee -a "$TMPFILE"
+
+############################################################
+# INTERNET
+############################################################
+echo "[INTERNET]" | tee -a "$TMPFILE"
+if ping -c1 8.8.8.8 >/dev/null 2>&1; then
+    echo -e "${GREEN}Internet: OK${NC}" | tee -a "$TMPFILE"
+else
+    echo -e "${RED}Internet: DOWN${NC}" | tee -a "$TMPFILE"
+    FAILED_FLAG=1
+fi
+echo | tee -a "$TMPFILE"
+
+############################################################
+# CLOUDFLARE
+############################################################
+echo "[CLOUDFLARE]" | tee -a "$TMPFILE"
+if systemctl is-active --quiet cloudflared; then
+    echo -e "${GREEN}cloudflared: RUNNING${NC}" | tee -a "$TMPFILE"
+else
+    echo -e "${RED}cloudflared: DOWN${NC}" | tee -a "$TMPFILE"
+    FAILED_FLAG=1
+fi
+echo | tee -a "$TMPFILE"
+
+############################################################
+# FAILED UNITS
+############################################################
+echo "[FAILED SYSTEMD UNITS]" | tee -a "$TMPFILE"
+FAILED=$(systemctl --failed --type=service --no-legend)
+
+if [[ -z "$FAILED" ]]; then
+    echo "None" | tee -a "$TMPFILE"
+else
+    FAILED_FLAG=1
+    echo -e "${RED}Service failures detected:${NC}" | tee -a "$TMPFILE"
+    echo "$FAILED" | tee -a "$TMPFILE"
+
+    echo "" | tee -a "$TMPFILE"
+    echo "---- Logs for failed units ----" | tee -a "$TMPFILE"
+
+    while read -r unit _; do
+      echo "" | tee -a "$TMPFILE"
+      echo "[$unit]" | tee -a "$TMPFILE"
+      journalctl -u "$unit" -n 20 --no-pager | tee -a "$TMPFILE"
+    done <<< "$(echo "$FAILED" | awk '{print $1}')"
+fi
+echo | tee -a "$TMPFILE"
+
+############################################################
+# PORT CHECKS
+############################################################
+PORTS=(8080 8081 8088 8089 8443 9997 5432 5672 80 443 22)
+
+echo "[PORTS]" | tee -a "$TMPFILE"
+for PORT in "${PORTS[@]}"; do
+  if ss -tulpn | grep -q ":$PORT "; then
+     echo -e "${GREEN}Port $PORT: OPEN${NC}" | tee -a "$TMPFILE"
+  else
+     echo -e "${RED}Port $PORT: CLOSED${NC}" | tee -a "$TMPFILE"
+     FAILED_FLAG=1
+  fi
+done
+echo | tee -a "$TMPFILE"
+
+############################################################
+# EMAIL IF FAILURE
+############################################################
+if [[ $FAILED_FLAG -eq 1 ]]; then
+  {
+    echo "Subject: GRIDBASE ALERT - Issues Detected"
+    echo "To: $EMAIL_TO"
+    echo
+    echo "Alert: System problems detected."
+    echo "Details below:"
+    cat "$TMPFILE"
+    echo ""
+    echo "Contact IT Administrator: info@gridbase.net"
+  } | $MSMTP_BIN "$EMAIL_TO"
+fi
+
+cat "$TMPFILE" | tee -a "$LOGFILE"
+EOF
+
+# Replace email placeholder
+sudo sed -i "s|__EMAIL_PLACEHOLDER__|$ALERT_EMAIL|g" /usr/local/bin/alert-check
+
+sudo chmod +x /usr/local/bin/alert-check
+
+echo -e "${GREEN}Alert-check script installed.${NC}"
+
+############################################################
+# 6. SYSTEMD SERVICE + TIMER
+############################################################
+echo -e "${BLUE}Installing systemd units...${NC}"
+
+cat <<EOF | sudo tee /etc/systemd/system/alert-check.service >/dev/null
+[Unit]
+Description=Gridbase Alert Check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/alert-check
+EOF
+
+cat <<EOF | sudo tee /etc/systemd/system/alert-check.timer >/dev/null
+[Unit]
+Description=Run alert-check every 10 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=10min
+Unit=alert-check.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable alert-check.timer
+sudo systemctl start alert-check.timer
+
+echo -e "${GREEN}Alert-check systemd timer installed and started.${NC}"
+
+echo -e "${BLUE}=== INSTALLATION COMPLETE ===${NC}"
+echo "Alert emails will be sent to: $ALERT_EMAIL"
+echo ""
