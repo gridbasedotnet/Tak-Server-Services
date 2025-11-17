@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Gridbase Sanity Check every 480 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=480min
+Unit=sanity-check.service
+
+[Install]
+WantedBy=timers.target
