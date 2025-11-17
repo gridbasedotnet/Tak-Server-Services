@@ -1,0 +1,12 @@
+[Unit]
+Description=Gridbase Sanity Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sanity-check
+
+# Log output with journalctl + optional file logging handled inside the script
+StandardOutput=journal
+StandardError=journal
