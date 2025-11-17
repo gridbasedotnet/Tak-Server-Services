@@ -1,0 +1,12 @@
+[Unit]
+Description=Gridbase Alert Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/alert-check
+
+# Log output goes to journal (script logs as well)
+StandardOutput=journal
+StandardError=journal
